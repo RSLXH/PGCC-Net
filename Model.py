@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "Data"
 OUTPUT_DIR = PROJECT_ROOT / "model"
+PREPROCESSING_SCHEMA = "pgcc_net_v5_strict_preprocessing"
 
 CONFIG = {
     "IMG_PATH": str(DATA_DIR / "Combined_Images.npy"),
@@ -29,7 +30,6 @@ CONFIG = {
     "BATCH_SIZE": 256,
     "LEARNING_RATE": 0.001,
     "EPOCHS": 60,
-    "SAMPLES_PER_EPOCH": 120000,
     "RANDOM_SEED": 42,
     "ADAPTIVE_LOG_VARS_INIT": [0.0, 0.0, 0.0, 0.0],
     "DIRECT_TAU_MAX": 1.10,
@@ -48,20 +48,53 @@ CONFIG = {
     "CHANNELS_LAST": True,
     "GATE_GAMMA": 0.30,
     "SOLAR_CONSTANT": 1367.0,
-    "MIN_MU0": 1e-3,
+    "RTOA_SCALE": 1400.0,
+    "PATCH_SIZE": 16,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Model-development stations from Supplementary Table S1. Only the training
+# subset of their 2017/2019/2020 observations is used for parameter estimation.
 TRAINING_STATIONS = (
     "BOM_SL003003", "BOM_SL012038", "BOM_SL023034", "BOM_SL032040",
-    "BOM_SL039083", "BOM_SL086282", "BSRN_FUA", "BSRN_HOW",
-    "BSRN_ISH", "BSRN_KWA", "BSRN_LYU", "BSRN_MNM", "BSRN_SAP", "BSRN_YUS",
+    "BOM_SL039083", "BOM_SL086282", "BOM_SL008315", "BOM_SL072150",
+    "BSRN_FUA", "BSRN_HOW", "BSRN_ISH", "BSRN_MNM", "BSRN_TAT", "BSRN_YUS",
 )
 
+# Spatially independent stations from Supplementary Table S2.
 SPATIAL_TEST_STATIONS = (
-    "BOM_SL005007", "BOM_SL008315", "BOM_SL072150", "BOM_SL091148",
-    "BSRN_ASP", "BSRN_COC", "BSRN_DWN", "BSRN_LAU", "BSRN_NEW", "BSRN_TAT",
+    "BOM_SL005007", "BOM_SL091148",
+    "BSRN_ASP", "BSRN_COC", "BSRN_DWN", "BSRN_KWA", "BSRN_LAU",
+    "BSRN_LYU", "BSRN_NEW", "BSRN_SAP",
+)
+
+DEVELOPMENT_YEARS = (2017, 2019, 2020)
+TEMPORAL_TEST_YEARS = (2016, 2018)
+TRAIN_FRACTION = 0.7
+
+# Keep the CSV reader's column aliases explicit. These constants were missing
+# even though read_model_metadata() already referenced them.
+MODEL_METADATA_CATEGORY_COLUMNS = frozenset({
+    "Network_Station_ID", "Station_ID", "station_id", "station", "Station",
+    "site", "Site", "SITE", "BSRN_ID", "bsrn_id", "Site Number", "site_number",
+    "id", "ID", "network", "Network", "source", "Source", "is_daytime",
+})
+MODEL_METADATA_FLOAT32_COLUMNS = frozenset({
+    "global2_mean", "global_mean", "Rg", "R_g", "global", "Global",
+    "direct_mean_H", "direct_H", "direct_mean", "Rdir", "R_dir", "direct", "Direct",
+    "diffuse_mean", "Rdif", "R_dif", "diffuse", "Diffuse",
+    "lat", "Lat", "latitude", "Latitude", "LAT",
+    "lon", "Lon", "longitude", "Longitude", "LON",
+    "SOZ", "soz", "ground_solar_zenith_mean", "evaluation_solar_zenith_deg",
+})
+MODEL_METADATA_COLUMN_CANDIDATES = (
+    MODEL_METADATA_CATEGORY_COLUMNS | MODEL_METADATA_FLOAT32_COLUMNS | frozenset({
+        "DOY", "doy", "dayofyear", "DayOfYear", "year", "Year", "YEAR", "yy",
+        "UTC", "utc", "datetime", "date_time", "time_utc", "DateTime",
+        "Timestamp", "timestamp", "date", "mm", "dd", "month", "Month",
+        "hour", "Hour", "HH", "time", "Time", "day", "Day",
+    })
 )
 
 def set_seed(seed: int = 42):
@@ -170,34 +203,38 @@ def read_model_metadata(path: str) -> pd.DataFrame:
 
 
 def infer_doy_from_df(df: pd.DataFrame, n: int) -> np.ndarray:
-    'Data processing note.'
+    """Use observed DOY/date for Eq. (6); missing dates must not become day 172."""
     for col in ["DOY", "doy", "dayofyear", "DayOfYear"]:
         if col in df.columns:
-            doy = pd.to_numeric(df[col], errors="coerce").fillna(172).values.astype(np.float32)
-            return np.clip(doy, 1, 366)
+            doy = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            if (len(doy) != n or not np.isfinite(doy).all()
+                    or not ((doy >= 1) & (doy <= 366)).all()
+                    or not np.equal(doy, np.floor(doy)).all()):
+                raise ValueError("DOY must contain valid integer days 1-366 for every sample")
+            return doy.astype(np.float32)
+    dates = observation_dates(df)
+    if dates is None or dates.isna().any() or len(dates) != n:
+        raise ValueError("Provide complete observed DOY or dates; missing dates cannot default to day 172")
+    return dates.dt.dayofyear.to_numpy(dtype=np.float32)
 
-    for col in ["UTC", "utc", "datetime", "date_time", "time_utc"]:
+
+def observation_dates(df):
+    """Parse supported full UTC date fields or explicit calendar components."""
+    for col in ("UTC", "utc", "datetime", "date_time", "time_utc",
+                "DateTime", "Timestamp", "timestamp", "date"):
         if col in df.columns:
-            dt = pd.to_datetime(df[col], errors="coerce", utc=True)
-            doy = dt.dt.dayofyear.fillna(172).values.astype(np.float32)
-            return np.clip(doy, 1, 366)
-
-    if all(c in df.columns for c in ["yy", "mm", "dd"]):
-        yy = pd.to_numeric(df["yy"], errors="coerce").fillna(2017).astype(int)
-        mm = pd.to_numeric(df["mm"], errors="coerce").fillna(6).astype(int)
-        dd = pd.to_numeric(df["dd"], errors="coerce").fillna(21).astype(int)
-        yy = yy.where(yy > 100, 2000 + yy)
-        dt = pd.to_datetime(dict(year=yy, month=mm, day=dd), errors="coerce")
-        doy = dt.dt.dayofyear.fillna(172).values.astype(np.float32)
-        return np.clip(doy, 1, 366)
-
-    if "date" in df.columns:
-        dt = pd.to_datetime(df["date"], errors="coerce")
-        doy = dt.dt.dayofyear.fillna(172).values.astype(np.float32)
-        return np.clip(doy, 1, 366)
-
-    print('Data processing note.')
-    return np.full(n, 172, dtype=np.float32)
+            return pd.to_datetime(df[col].astype(str), errors="coerce", utc=True)
+    year = find_optional_column(df, ("year", "Year", "YEAR", "yy"))
+    month = find_optional_column(df, ("mm", "month", "Month"))
+    day = find_optional_column(df, ("dd", "day", "Day"))
+    if year and month and day:
+        years = pd.to_numeric(df[year], errors="coerce")
+        if year == "yy":
+            years = years.where(~years.between(0, 99), years + 2000)
+        return pd.to_datetime({"year": years,
+                               "month": pd.to_numeric(df[month], errors="coerce"),
+                               "day": pd.to_numeric(df[day], errors="coerce")}, errors="coerce", utc=True)
+    return None
 
 
 def earth_sun_distance_factor(doy: np.ndarray) -> np.ndarray:
@@ -245,16 +282,19 @@ def infer_station_ids_from_df(df: pd.DataFrame, n: int) -> np.ndarray:
 
 
 def _parse_hour_from_time_series(s: pd.Series) -> pd.Series:
-    'Data processing note.'
-    parsed = pd.to_datetime(s.astype(str), errors="coerce")
-    hour = parsed.dt.hour
-
+    """Handle UTC hour, HHMM, HHMMSS, and clock strings without guessing dates."""
     numeric = pd.to_numeric(s, errors="coerce")
-    mask_hour = hour.isna() & numeric.between(0, 23)
-    hour.loc[mask_hour] = numeric.loc[mask_hour]
-    mask_hhmm = hour.isna() & numeric.between(100, 235959)
-    hour.loc[mask_hhmm] = (numeric.loc[mask_hhmm] // 100).astype(float)
-
+    hour = pd.Series(np.nan, index=s.index, dtype=float)
+    plain = numeric.between(0, 23)
+    hour.loc[plain] = np.floor(numeric.loc[plain])
+    hhmm = numeric.between(100, 2359) & numeric.eq(np.floor(numeric)) & ((numeric % 100) < 60)
+    hour.loc[hhmm] = np.floor(numeric.loc[hhmm] / 100)
+    hhmmss = (numeric.between(10000, 235959) & numeric.eq(np.floor(numeric))
+              & ((numeric // 100) % 100 < 60) & ((numeric % 100) < 60))
+    hour.loc[hhmmss] = np.floor(numeric.loc[hhmmss] / 10000)
+    clock = s.astype(str).str.match(r"^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$")
+    parsed = pd.to_datetime("2000-01-01 " + s.astype(str).where(clock), errors="coerce", utc=True)
+    hour.loc[clock] = parsed.loc[clock].dt.hour
     return hour
 
 
@@ -264,30 +304,19 @@ def infer_month_hour_from_df(df: pd.DataFrame, n: int):
         df,
         ["UTC", "utc", "datetime", "date_time", "time_utc", "DateTime", "Timestamp", "timestamp"],
     )
-    if dt_col is not None:
-        dt = pd.to_datetime(df[dt_col], errors="coerce", utc=True)
-        month = dt.dt.month.fillna(0).astype(int).values
-        hour = dt.dt.hour.fillna(-1).astype(int).values
-        return month, hour
-
-    if "mm" in df.columns:
-        month = pd.to_numeric(df["mm"], errors="coerce").fillna(0).astype(int)
-    elif "month" in df.columns:
-        month = pd.to_numeric(df["month"], errors="coerce").fillna(0).astype(int)
-    elif "Month" in df.columns:
-        month = pd.to_numeric(df["Month"], errors="coerce").fillna(0).astype(int)
-    elif "date" in df.columns:
-        dt = pd.to_datetime(df["date"], errors="coerce")
-        month = dt.dt.month.fillna(0).astype(int)
+    dates = observation_dates(df)
+    if dt_col is not None and dates is not None:
+        month, hour = dates.dt.month, dates.dt.hour
     else:
-        month = pd.Series([0] * n, dtype=int)
-
-    hour_col = find_optional_column(df, ["hour", "Hour", "HH", "time", "Time"])
-    if hour_col is not None:
-        hour = _parse_hour_from_time_series(df[hour_col]).fillna(-1).astype(int)
-    else:
-        hour = pd.Series([-1] * n, dtype=int)
-
+        month_col = find_optional_column(df, ("mm", "month", "Month"))
+        month = (pd.to_numeric(df[month_col], errors="coerce") if month_col
+                 else dates.dt.month if dates is not None else pd.Series(np.nan, index=df.index))
+        hour_col = find_optional_column(df, ["hour", "Hour", "HH", "time", "Time"])
+        hour = (_parse_hour_from_time_series(df[hour_col]) if hour_col
+                else pd.Series(np.nan, index=df.index))
+    if (len(month) != n or len(hour) != n or not month.between(1, 12).all()
+            or not month.eq(np.floor(month)).all() or not hour.between(0, 23).all()):
+        raise ValueError("CI backgrounds require valid observed months and UTC hours for every sample")
     return month.values.astype(int), hour.values.astype(int)
 
 
@@ -374,7 +403,6 @@ def compute_latband_ci_backgrounds(imgs, ci_band: int, latitudes: np.ndarray,
                 continue
             low = np.nanpercentile(arr, low_q, axis=0).astype(np.float32)
             high = np.nanpercentile(arr, high_q, axis=0).astype(np.float32)
-            high = np.where((high - low) < 1e-6, low + 1e-6, high).astype(np.float32)
             out_keys.append(str(k)); lows.append(low); highs.append(high); counts.append(len(local_idx))
         if len(out_keys) == 0:
             sample = np.array(imgs[0, ci_band, :, :], dtype=np.float32)
@@ -390,7 +418,6 @@ def compute_latband_ci_backgrounds(imgs, ci_band: int, latitudes: np.ndarray,
     arr_all = np.where(np.isfinite(arr_all), arr_all, np.nan)
     g_low = np.nanpercentile(arr_all, low_q, axis=0).astype(np.float32)
     g_high = np.nanpercentile(arr_all, high_q, axis=0).astype(np.float32)
-    g_high = np.where((g_high - g_low) < 1e-6, g_low + 1e-6, g_high).astype(np.float32)
 
     np.savez_compressed(
         save_path,
@@ -434,13 +461,133 @@ def index_fingerprint(values):
     return hashlib.sha256(np.asarray(values, dtype=np.int64).tobytes()).hexdigest()
 
 
+def infer_years_from_df(metadata):
+    """Read observed calendar years; never guess a missing year for a split."""
+    for column in ("year", "Year", "YEAR", "yy"):
+        if column in metadata.columns:
+            years = pd.to_numeric(metadata[column], errors="coerce").to_numpy(dtype=float)
+            if column == "yy":
+                years = np.where((years >= 0) & (years <= 99), 2000 + years, years)
+            if (np.isfinite(years).all() and np.equal(years, np.floor(years)).all()
+                    and ((years >= 1900) & (years <= 2100)).all()):
+                return years.astype(np.int64)
+
+    for column in ("UTC", "utc", "datetime", "date_time", "time_utc",
+                   "DateTime", "Timestamp", "timestamp", "date"):
+        if column in metadata.columns:
+            # Numeric hours must not silently become nanoseconds since 1970.
+            dates = pd.to_datetime(metadata[column].astype(str), errors="coerce", utc=True)
+            if dates.notna().all():
+                return dates.dt.year.to_numpy(dtype=np.int64)
+    raise ValueError(
+        "Calendar years are required to enforce the manuscript split. Supply "
+        "a valid year/yy column or a complete date-time column; DOY alone is insufficient."
+    )
+
+
+def manuscript_split_indices(metadata, seed=42):
+    """Build the manuscript's disjoint development/spatial/temporal subsets.
+
+    The seed provides a reproducible new split; it cannot recover the exact
+    historical split without the original experiment's saved row indices.
+    """
+    stations = infer_station_ids_from_df(metadata, len(metadata)).astype(str)
+    development = set(TRAINING_STATIONS)
+    spatial = set(SPATIAL_TEST_STATIONS)
+    if len(development) != 14 or len(spatial) != 10 or development & spatial:
+        raise ValueError("Expected 14 development and 10 disjoint spatial-test stations")
+    unknown = set(stations.tolist()) - (development | spatial)
+    if unknown:
+        raise ValueError("Stations outside Supplementary Tables S1/S2: {}".format(sorted(unknown)))
+    years = infer_years_from_df(metadata)
+    unsupported = set(np.unique(years).tolist()) - set(DEVELOPMENT_YEARS + TEMPORAL_TEST_YEARS)
+    if unsupported:
+        raise ValueError("Years outside the manuscript's 2016-2020 study period: {}".format(sorted(unsupported)))
+    development_mask = np.isin(stations, TRAINING_STATIONS) & np.isin(years, DEVELOPMENT_YEARS)
+    present = set(stations[development_mask].tolist())
+    if present != development:
+        raise ValueError("Missing development stations in 2017/2019/2020: {}".format(sorted(development - present)))
+    development_indices = np.flatnonzero(development_mask)
+    shuffled = np.random.RandomState(int(seed)).permutation(development_indices)
+    # Match a 30% validation split, rounded upward for indivisible sample counts.
+    n_validation = int(np.ceil((1.0 - TRAIN_FRACTION) * len(shuffled) - 1e-12))
+    if n_validation == 0 or n_validation >= len(shuffled):
+        raise ValueError("Insufficient development observations for a 7:3 split")
+    subsets = {
+        "train": np.sort(shuffled[n_validation:]).astype(np.int64),
+        "validation": np.sort(shuffled[:n_validation]).astype(np.int64),
+        "spatial_test": np.flatnonzero(np.isin(stations, SPATIAL_TEST_STATIONS)
+                                      & np.isin(years, DEVELOPMENT_YEARS)).astype(np.int64),
+        "temporal_test": np.flatnonzero(np.isin(years, TEMPORAL_TEST_YEARS)).astype(np.int64),
+    }
+    if set(stations[subsets["train"]].tolist()) != development:
+        raise ValueError("Random training subset omits a development station; check sample counts")
+    return subsets
+
+
+def file_signature(path):
+    path = Path(clean_path(path)).resolve()
+    stat = path.stat()
+    return {"path": str(path), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def preprocessing_contract():
+    keys = ("SOLAR_CONSTANT", "RTOA_SCALE", "CI_BAND_INDEX", "CI_LOW_PERCENTILE",
+            "CI_HIGH_PERCENTILE", "CI_HIGH_THRESHOLD", "CI_BACKGROUND_MODE",
+            "CI_GROUP_MIN_SAMPLES", "CI_LAT_BAND_WIDTH_DEG", "CI_LOCAL_HOUR_BIN", "PATCH_SIZE")
+    return {"schema": PREPROCESSING_SCHEMA, "settings": {key: CONFIG[key] for key in keys}}
+
+
+def preprocessing_artifact_hashes():
+    """Bind checkpoints to the normalization/CI artifacts used to train them."""
+    with open(CONFIG["STATS_PATH"], encoding="utf-8") as handle:
+        stats = json.load(handle)
+    hashes = {"stats": hashlib.sha256(Path(CONFIG["STATS_PATH"]).read_bytes()).hexdigest()}
+    if stats["ci_background_mode"] == "latband_month_localhour":
+        hashes["ci_background"] = hashlib.sha256(Path(CONFIG["CI_BG_PATH"]).read_bytes()).hexdigest()
+    return hashes
+
+
+def training_statistics(images, labels, indices, batch_size=1024):
+    """Compute population moments of every training sample in bounded memory."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if not len(indices):
+        raise ValueError("Training indices are empty")
+    image_count = label_count = 0
+    image_mean = image_m2 = label_mean = label_m2 = None
+    def merge(count, mean, m2, values):
+        batch_count = len(values)
+        batch_mean = values.mean(axis=0)
+        batch_m2 = np.square(values - batch_mean).sum(axis=0)
+        if not count:
+            return batch_count, batch_mean, batch_m2
+        delta = batch_mean - mean
+        combined = count + batch_count
+        return (combined, mean + delta * batch_count / combined,
+                m2 + batch_m2 + delta ** 2 * count * batch_count / combined)
+    for start in range(0, len(indices), batch_size):
+        selected = indices[start:start + batch_size]
+        image_batch = np.asarray(images[selected], dtype=np.float64)
+        label_batch = np.asarray(labels[selected], dtype=np.float64)
+        if not np.isfinite(image_batch).all() or not np.isfinite(label_batch).all():
+            raise ValueError("Training data contain invalid reflectances or labels; apply upstream quality control")
+        pixels = image_batch.transpose(0, 2, 3, 1).reshape(-1, image_batch.shape[1])
+        image_count, image_mean, image_m2 = merge(image_count, image_mean, image_m2, pixels)
+        label_count, label_mean, label_m2 = merge(label_count, label_mean, label_m2, label_batch)
+    image_std = np.sqrt(image_m2 / image_count)
+    label_std = np.sqrt(label_m2 / label_count)
+    # Constant columns have no meaningful scale; keep the prior unit-scale fallback.
+    return image_mean, np.where(image_std < 1e-6, 1.0, image_std), label_mean, np.where(label_std < 1e-6, 1.0, label_std)
+
+
 def ensure_stats_exist(metadata=None):
     train_indices = load_index_file(CONFIG["TRAIN_INDEX_PATH"])
     train_signature = index_fingerprint(train_indices)
+    data_signature = {key: file_signature(CONFIG[key]) for key in ("IMG_PATH", "ANG_PATH", "LBL_PATH")}
     required_keys = {
         "img_mean", "img_std", "lbl_mean", "lbl_std", "ci_background_mode",
         "ci_band_index", "train_index_fingerprint", "ci_lat_band_width_deg",
-        "ci_local_hour_bin",
+        "ci_local_hour_bin", "preprocessing_contract", "data_signature",
     }
     stats_exists = os.path.exists(CONFIG["STATS_PATH"])
     bg_required = CONFIG.get("CI_BACKGROUND_MODE", "global") == "latband_month_localhour"
@@ -451,6 +598,8 @@ def ensure_stats_exist(metadata=None):
             stats = json.load(f)
         if (required_keys.issubset(set(stats.keys())) and bg_exists
                 and stats.get("train_index_fingerprint") == train_signature
+                and stats.get("preprocessing_contract") == preprocessing_contract()
+                and stats.get("data_signature") == data_signature
                 and stats.get("ci_background_mode") == CONFIG.get("CI_BACKGROUND_MODE")
                 and float(stats.get("ci_lat_band_width_deg")) == float(CONFIG["CI_LAT_BAND_WIDTH_DEG"])
                 and int(stats.get("ci_local_hour_bin")) == int(CONFIG["CI_LOCAL_HOUR_BIN"])):
@@ -467,20 +616,7 @@ def ensure_stats_exist(metadata=None):
     col_g, col_dir, col_dif = get_label_columns(df)
     lbls = df[[col_g, col_dir, col_dif]].values.astype(np.float32)
 
-    n_sample = min(20000, len(train_indices))
-    indices = np.random.choice(train_indices, size=n_sample, replace=False)
-
-    s_img = imgs[indices].astype(np.float32)
-    s_img = np.nan_to_num(s_img, nan=0.0, posinf=0.0, neginf=0.0)
-
-    img_mean = np.mean(s_img, axis=(0, 2, 3))
-    img_std = np.std(s_img, axis=(0, 2, 3))
-    img_std[img_std < 1e-6] = 1.0
-
-    s_lbl = lbls[indices]
-    lbl_mean = np.mean(s_lbl, axis=0)
-    lbl_std = np.std(s_lbl, axis=0)
-    lbl_std[lbl_std < 1e-6] = 1.0
+    img_mean, img_std, lbl_mean, lbl_std = training_statistics(imgs, lbls, train_indices)
 
     ci_band = int(CONFIG["CI_BAND_INDEX"])
     ci_band = max(0, min(ci_band, imgs.shape[1] - 1))
@@ -499,18 +635,18 @@ def ensure_stats_exist(metadata=None):
         "ci_local_hour_bin": int(CONFIG["CI_LOCAL_HOUR_BIN"]),
         "train_index_fingerprint": train_signature,
         "train_sample_count": int(len(train_indices)),
+        "normalization_sample_count": int(len(train_indices)),
+        "standard_deviation_ddof": 0,
+        "preprocessing_contract": preprocessing_contract(),
+        "data_signature": data_signature,
     }
 
     if CONFIG.get("CI_BACKGROUND_MODE") == "latband_month_localhour":
         latitudes, longitudes = infer_lat_lon_from_df(df, len(df))
         months, hours = infer_month_hour_from_df(df, len(df))
-        if "is_daytime" in df.columns:
-            daytime = df["is_daytime"].astype(str).str.lower().isin(["true", "1"]).to_numpy()
-        else:
-            sza_col = find_optional_column(df, ["ground_solar_zenith_mean", "evaluation_solar_zenith_deg", "SOZ", "soz"])
-            if sza_col is None:
-                raise ValueError('Data processing note.')
-            daytime = pd.to_numeric(df[sza_col], errors="coerce").lt(90.0).to_numpy()
+        # Use the same central-pixel satellite geometry as the model input.
+        angles = np.load(clean_path(CONFIG["ANG_PATH"]), mmap_mode="r")
+        daytime = np.asarray(angles[:, 2]) < 90.0
         ci_train_indices = train_indices[daytime[train_indices]]
         if len(ci_train_indices) < int(CONFIG["CI_GROUP_MIN_SAMPLES"]):
             raise ValueError('Data processing note.')
@@ -536,13 +672,10 @@ def ensure_stats_exist(metadata=None):
         stats["ci_clear"] = None
         stats["ci_cloud"] = None
     else:
-        s_img_for_ci = imgs[indices].astype(np.float32)
-        s_img_for_ci = np.nan_to_num(s_img_for_ci, nan=0.0, posinf=0.0, neginf=0.0)
+        s_img_for_ci = imgs[train_indices].astype(np.float32)
         vis_values = s_img_for_ci[:, ci_band, :, :].reshape(-1)
         ci_clear = safe_percentile(vis_values, CONFIG["CI_LOW_PERCENTILE"], default=0.0)
         ci_cloud = safe_percentile(vis_values, CONFIG["CI_HIGH_PERCENTILE"], default=ci_clear + 1.0)
-        if abs(ci_cloud - ci_clear) < 1e-6:
-            ci_cloud = ci_clear + 1.0
         stats["ci_clear"] = ci_clear
         stats["ci_cloud"] = ci_cloud
 
@@ -554,10 +687,35 @@ def ensure_stats_exist(metadata=None):
 
 
 class NativeDataset(Dataset):
-    def __init__(self, img_path, ang_path, lbl_path, stats_path, metadata=None):
-        ensure_stats_exist(metadata=metadata)
+    def __init__(self, img_path, ang_path, lbl_path, stats_path, metadata=None,
+                 fit_stats=True, require_labels=True):
+        self.images = np.load(clean_path(img_path), mmap_mode="r")
+        self.angles = np.load(clean_path(ang_path), mmap_mode="r")
+        df = metadata if metadata is not None else read_model_metadata(lbl_path)
+        patch = int(CONFIG["PATCH_SIZE"])
+        if (self.images.ndim != 4 or tuple(self.images.shape[1:]) != (6, patch, patch)
+                or self.angles.shape != (len(self.images), 4) or len(df) != len(self.images)):
+            raise ValueError("Expected aligned images (N,6,{0},{0}), native angles (N,4), and N metadata rows".format(patch))
+        if not np.isfinite(self.angles).all():
+            raise ValueError("Satellite angles contain missing or non-finite values")
+        # Native angle order is [VZA, VAA, SZA, SAA], all in degrees.
+        if (not ((self.angles[:, 0] >= 0) & (self.angles[:, 0] <= 180)).all()
+                or not ((self.angles[:, 2] >= 0) & (self.angles[:, 2] <= 180)).all()):
+            raise ValueError("Solar and viewing zenith angles must be in degrees within [0,180]")
+        self.labels = None
+        if require_labels:
+            col_g, col_dir, col_dif = get_label_columns(df)
+            self.labels = df[[col_g, col_dir, col_dif]].values.astype(np.float32)
+            if not np.isfinite(self.labels).all():
+                raise ValueError("Observed radiation labels contain missing or non-finite values")
+        if fit_stats:
+            if not require_labels:
+                raise ValueError("Fitting preprocessing requires training labels and saved training indices")
+            ensure_stats_exist(metadata=df)
         with open(stats_path, "r") as f:
             stats = json.load(f)
+        if stats.get("preprocessing_contract") != preprocessing_contract():
+            raise ValueError("Normalization artifacts use a different preprocessing contract")
 
         self.img_mean = np.array(stats["img_mean"]).reshape(6, 1, 1).astype(np.float32)
         self.img_std = np.array(stats["img_std"]).reshape(6, 1, 1).astype(np.float32)
@@ -569,12 +727,6 @@ class NativeDataset(Dataset):
         self.ci_clear = stats.get("ci_clear", 0.0)
         self.ci_cloud = stats.get("ci_cloud", 1.0)
 
-        self.images = np.load(clean_path(img_path), mmap_mode="r")  # shape: (N, 6, 16, 16)
-        self.angles = np.load(clean_path(ang_path), mmap_mode="r")  # shape: (N, 4) = [SAZ, SAA, SOZ, SOA]
-
-        df = metadata if metadata is not None else read_model_metadata(lbl_path)
-        col_g, col_dir, col_dif = get_label_columns(df)
-        self.labels = df[[col_g, col_dir, col_dif]].values.astype(np.float32)
         self.doy = infer_doy_from_df(df, len(df)).astype(np.float32)
 
         self.station_ids = infer_station_ids_from_df(df, len(df)).astype(str)
@@ -601,14 +753,10 @@ class NativeDataset(Dataset):
             # script, without regenerating the CI background.
             recorded_bg_path = clean_path(stats.get("ci_bg_path", ""))
             configured_bg_path = clean_path(CONFIG.get("CI_BG_PATH", ""))
-            if recorded_bg_path and os.path.exists(recorded_bg_path):
-                bg_path = recorded_bg_path
-            elif configured_bg_path and os.path.exists(configured_bg_path):
+            if configured_bg_path and os.path.exists(configured_bg_path):
                 bg_path = configured_bg_path
-                print(
-                    "CI background path in stats_cpg.json is stale; using current configured path: {}"
-                    .format(bg_path)
-                )
+            elif recorded_bg_path and os.path.exists(recorded_bg_path):
+                bg_path = recorded_bg_path
             else:
                 bg_path = recorded_bg_path or configured_bg_path
             if not bg_path or not os.path.exists(bg_path):
@@ -635,14 +783,10 @@ class NativeDataset(Dataset):
             self.ci_clear = float(self.ci_clear)
             self.ci_cloud = float(self.ci_cloud)
 
-        if "SOZ" in df.columns:
-            self.soz = df["SOZ"].values.astype(np.float32)
-        elif "soz" in df.columns:
-            self.soz = df["soz"].values.astype(np.float32)
-        else:
-            self.soz = np.asarray(self.angles[:, 2], dtype=np.float32)
+        self.soz = np.asarray(self.angles[:, 2], dtype=np.float32)
 
-        self.use_feature_cache = bool(CONFIG.get("USE_FEATURE_CACHE", True))
+        # Inference must never fit statistics or reuse a training-row cache.
+        self.use_feature_cache = bool(fit_stats and require_labels and CONFIG.get("USE_FEATURE_CACHE", True))
         self.ang_cache = None
         self.phys_cache = None
         self.y_cache = None
@@ -658,14 +802,12 @@ class NativeDataset(Dataset):
 
     @staticmethod
     def process_angles(ang_arr):
-        'Data processing note.'
+        """Native [VZA,VAA,SZA,SAA] degrees -> manuscript's three cosines."""
         rad = np.deg2rad(ang_arr.astype(np.float32))
-        saz, saa, soz, soa = rad[0], rad[1], rad[2], rad[3]
-        mu0 = np.cos(soz)
-        vza_cos = np.cos(saz)
-        # cos(angular difference) is invariant to wrapping and is identical to
-        # Fold the relative azimuth into the 0-180 degree range.
-        raa = np.arccos(np.clip(np.cos(soa - saa), -1.0, 1.0))
+        vza, vaa, sza, saa = rad[0], rad[1], rad[2], rad[3]
+        mu0 = np.cos(sza)
+        vza_cos = np.cos(vza)
+        raa = np.arccos(np.clip(np.cos(saa - vaa), -1.0, 1.0))
         return np.array([
             mu0,
             vza_cos,
@@ -729,23 +871,22 @@ class NativeDataset(Dataset):
         'Data processing note.'
         soz_rad = np.deg2rad(float(raw_ang[2]))
         mu0 = float(np.cos(soz_rad))
-        mu0 = max(mu0, 0.0)
-        mu0_safe = max(mu0, CONFIG["MIN_MU0"])
 
         dr = float(earth_sun_distance_factor(np.array([doy], dtype=np.float32))[0])
-        rtoa_h = CONFIG["SOLAR_CONSTANT"] * dr * mu0
-        rtoa_norm = rtoa_h / 1400.0
+        # Manuscript Eq. (5): extraterrestrial NORMAL irradiance, without mu0.
+        # Horizontal projection is a different quantity, used only for diagnostics.
+        rtoa = CONFIG["SOLAR_CONSTANT"] * dr
+        rtoa_norm = rtoa / CONFIG["RTOA_SCALE"]
 
-        # Kasten-Young (1989) relative optical air mass. Night-time samples keep
-        # the capped value used by the previous pipeline; daytime high-SZA
-        # samples are more accurate than the plane-parallel 1/cos(SZA) form.
+        # Manuscript Eq. (7): Kasten-Young (1989), without a daytime cap.
+        # The value for night-time rows is only a numerical fallback; it must
+        # not be interpreted as the Kasten-Young formula beyond its domain.
         soz_deg = float(raw_ang[2])
         if 0.0 <= soz_deg < 90.0:
             airmass = 1.0 / (
                 np.cos(np.deg2rad(soz_deg))
                 + 0.50572 * (96.07995 - soz_deg) ** (-1.6364)
             )
-            airmass = min(float(airmass), 10.0)
         else:
             airmass = 10.0
         airmass_norm = airmass / 10.0
@@ -767,9 +908,14 @@ class NativeDataset(Dataset):
 
         expected_meta = {
             "n": int(len(self.images)),
-            "feature_schema_version": "pgcc_net_v3_normalized_descriptors",
+            "feature_schema_version": PREPROCESSING_SCHEMA,
+            "data_signature": {key: file_signature(CONFIG[key]) for key in ("IMG_PATH", "ANG_PATH", "LBL_PATH")},
+            "preprocessing_artifact_hashes": preprocessing_artifact_hashes(),
             "angle_encoding": "cos_sza_cos_vza_cos_raa_v1",
-            "airmass_formula": "kasten_young_1989_capped_at_10",
+            "airmass_formula": "kasten_young_1989_uncapped_daytime",
+            "rtoa_formula": "solar_constant_times_dr_normal_irradiance",
+            "solar_constant": float(CONFIG["SOLAR_CONSTANT"]),
+            "rtoa_scale": float(CONFIG["RTOA_SCALE"]),
             "ci_band_index": int(self.ci_band_index),
             "ci_background_mode": str(self.ci_background_mode),
             "ci_low_percentile": float(CONFIG["CI_LOW_PERCENTILE"]),
@@ -803,7 +949,8 @@ class NativeDataset(Dataset):
 
         for i in tqdm(range(n), desc="Precompute CPG features"):
             img = np.array(self.images[i], dtype=np.float32)
-            img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+            if not np.isfinite(img).all():
+                raise ValueError("Invalid reflectance in sample {}; apply upstream quality control".format(i))
             raw_ang = np.array(self.angles[i], dtype=np.float32)
             ci_features = self.compute_ci_features(img, idx=i)
             ang_all[i] = self.process_angles(raw_ang)
@@ -819,7 +966,8 @@ class NativeDataset(Dataset):
 
     def __getitem__(self, idx):
         img = np.array(self.images[idx], dtype=np.float32)  # (6, 16, 16)
-        img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(img).all():
+            raise ValueError("Invalid reflectance in sample {}; apply upstream quality control".format(idx))
         img_norm = (img - self.img_mean) / self.img_std
 
         if self.use_feature_cache and self.ang_cache is not None:
@@ -831,16 +979,18 @@ class NativeDataset(Dataset):
             raw_ang = np.array(self.angles[idx]).astype(np.float32)
             ang_encoded = self.process_angles(raw_ang)
             phys = self.compute_physical_features(raw_ang, self.doy[idx], ci_features)
-            label = self.labels[idx]
-            label_norm = (label - self.lbl_mean) / self.lbl_std
+            label_norm = ((self.labels[idx] - self.lbl_mean) / self.lbl_std
+                          if self.labels is not None else None)
 
-        return {
+        result = {
             "x_img": torch.from_numpy(img_norm),
             "x_ang": torch.from_numpy(ang_encoded),
             "x_phys": torch.from_numpy(phys),
-            "y": torch.from_numpy(label_norm),
             "soz": torch.tensor(self.soz[idx]),
         }
+        if label_norm is not None:
+            result["y"] = torch.from_numpy(label_norm)
+        return result
 
 
 class _DenseLayer(nn.Module):
@@ -955,11 +1105,11 @@ class CPGDeepDenseNet16(nn.Module):
         self.feature_dim = 128
 
         # Component-specific physical guidance gates
-        # Rg: normalized [Rtoa_H, mu0, airmass, CI_mean]
+        # Rg: normalized [Rtoa, mu0, airmass, CI_mean]; Rtoa is normal irradiance.
         self.gate_g = PhysicalGuidanceGate(phys_dim=4, feature_dim=self.feature_dim, gamma=gate_gamma)
-        # Rdir: normalized [Rtoa_H, mu0, airmass, CI_mean, CI_high]
+        # Rdir: normalized [Rtoa, mu0, airmass, CI_mean, CI_high]
         self.gate_dir = PhysicalGuidanceGate(phys_dim=5, feature_dim=self.feature_dim, gamma=gate_gamma)
-        # Rdif: normalized [Rtoa_H, mu0, airmass, CI_mean, CI_high, CI_mid, CI_edge]
+        # Rdif: normalized [Rtoa, mu0, airmass, CI_mean, CI_high, CI_mid, CI_edge]
         self.gate_dif = PhysicalGuidanceGate(phys_dim=7, feature_dim=self.feature_dim, gamma=gate_gamma)
         self.head_g = nn.Sequential(
             nn.Linear(self.feature_dim, 64), nn.ReLU(inplace=True),
@@ -1022,7 +1172,8 @@ class CPGDeepDenseNet16(nn.Module):
 
         # Beam transmittance is retained only as an evaluation diagnostic; it is
         # not an output parameterization and does not affect the forward estimates.
-        rtoa_h = torch.clamp(rtoa_norm * 1400.0, min=0.0)
+        rtoa = torch.clamp(rtoa_norm * CONFIG["RTOA_SCALE"], min=0.0)
+        rtoa_h = rtoa * torch.clamp(mu0, min=0.0)
         pred_tau = torch.clamp(
             pred_dir / torch.clamp(rtoa_h, min=1.0),
             min=0.0,
@@ -1034,6 +1185,7 @@ class CPGDeepDenseNet16(nn.Module):
             "gate_dir_mean": gate_dir.mean().detach(),
             "gate_dif_mean": gate_dif.mean().detach(),
             "pred_tau": pred_tau,
+            "rtoa": rtoa,
             "rtoa_h": rtoa_h,
         }
         return pred_g, pred_dir, pred_dif, aux
@@ -1085,10 +1237,10 @@ class AdaptiveMSESoftClosureLoss(nn.Module):
             "loss_dif": float(l_dif.detach().cpu()),
             "loss_phy": float(l_closure.detach().cpu()),
             "monitor": float(monitor.detach().cpu()),
-            "weight_g": float(precision[0].detach().cpu()),
-            "weight_dir": float(precision[1].detach().cpu()),
-            "weight_dif": float(precision[2].detach().cpu()),
-            "weight_phy": float(precision[3].detach().cpu()),
+            "weight_g": float((0.5 * precision[0]).detach().cpu()),
+            "weight_dir": float((0.5 * precision[1]).detach().cpu()),
+            "weight_dif": float((0.5 * precision[2]).detach().cpu()),
+            "weight_phy": float((0.5 * precision[3]).detach().cpu()),
         }
         return loss, logs
 
